@@ -304,7 +304,7 @@ async def set_on_off(args=()):
         print("Expects to be connected!")
         return
 
-    if args[0] != "on" and args[0] != "off":
+    if args[0] not in ("on", "off"):
         print("Warning: expected 'on' or 'off', defaulting to on.")
 
     if connected_light.supports_on_off:
@@ -366,6 +366,7 @@ async def main():
                 break
 
             elif command == "help" and expect_args(args, 0):
+                commands.sort(key=lambda c: (ord(c[0])))
                 print(f"Commands: {", ".join(commands)}")
 
             elif command == "connect" and expect_args(args, 1):
