@@ -1,0 +1,410 @@
+#!/usr/bin/env python
+
+import asyncio
+import json
+import random
+import re
+from bleak import BleakScanner, BLEDevice, AdvertisementData
+import HueBLE
+import readline
+import os
+import signal
+from text_morse_code_converter import morse_code_converter
+
+prompt = "[{}] >> "
+status = "DISCONNECTED"
+
+connected_light = None
+
+commands = [
+    "help",
+    "connect",
+    "discover",
+    "disconnect",
+    "quit",
+    "exit",
+    "brightness",
+    "info",
+    "power",
+    "strobe",
+    "morse",
+]
+
+current_task: asyncio.Task | None = None
+
+
+def parse_tokens(text: str):
+    tokens = []
+    current = []
+    in_quotes = False
+
+    for char in text.strip():
+        if char == '"':
+            in_quotes = not in_quotes
+        elif char == " " and not in_quotes:
+            if current:
+                tokens.append("".join(current).lower())
+                current = []
+        else:
+            current.append(char)
+
+    if current:
+        tokens.append("".join(current).lower())
+
+    if not tokens:
+        return "", []
+
+    return tokens[0], tokens[1:]
+
+
+def signal_handler(sig, frame):
+    global current_task
+
+    if current_task is not None and not current_task.done():
+        current_task.cancel()
+    else:
+        loop = asyncio.get_event_loop()
+        loop.stop()
+        exit(1)
+
+
+def expect_args(data, length):
+    valid = len(data) == length
+    if valid:
+        return True
+
+    else:
+        print("Bad args.")
+        return False
+
+
+async def setup_light(light: HueBLE.HueBleLight):
+    global status
+    global connected_light
+
+    if connected_light is not None:
+        print("Expects to not be connected!")
+        return
+
+    await light.connect()
+
+    connected_light = light
+
+    status = f"CONNECTED: {light.name}"
+
+
+def scan_predicate(device: BLEDevice, data: AdvertisementData):
+    if len(data.service_uuids) < 6:
+        return False
+    if (
+        not device.name
+        or data.service_uuids[7] != "932c32bd-0000-47a2-835a-a8d455b859dd"
+    ):  # Could not work for some devices
+        return True
+
+    return False
+
+
+def completer(text, state):
+    matches = [cmd for cmd in commands if cmd.startswith(text)]
+    return matches[state] if state < len(matches) else None
+
+
+async def connect(args=()):
+    address = str(args[0])
+
+    if re.match("^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$", address) is None:
+        print(f"'{address}' is not a valid MAC address!")
+        return False
+
+    print(f"Connecting to {address.upper()}...")
+
+    device = await BleakScanner.find_device_by_address(address)
+
+    if device is None:
+        print(f"Could not find device at {address.upper()}!")
+        return False
+
+    light = HueBLE.HueBleLight(device)
+
+    await setup_light(light)
+
+    print("Connected!")
+
+    return True
+
+
+async def discover(args=()):
+    print("Discovering devices...")
+
+    scanner = BleakScanner()
+
+    data = await scanner.discover(return_adv=True)
+
+    found = []
+
+    for key in data.keys():
+        device = data.get(key)[0]
+        adv = data.get(key)[1]
+
+        if scan_predicate(device, adv):
+            print(f"Found: {device.name}@{device.address}.")
+            found.append(device)
+
+    print(f"Done. Discovered {len(data)} devices, {len(found)} real lamp(s)")
+
+    if len(found) <= 0:
+        print("Found no lamps!")
+        return False
+
+    print("Connecting to the first discovered device...")
+
+    await setup_light(HueBLE.HueBleLight(found[0]))
+
+    print("Connected!")
+
+    return True
+
+
+async def info(args=()):
+    global connected_light
+
+    if connected_light is None:
+        print("Expects to be connected!")
+        return
+
+    props = {
+        # Static / connection properties (no polling needed)
+        "address": connected_light.address,
+        "name": connected_light.name,
+        "connected": connected_light.connected,
+        "authenticated": connected_light.authenticated,
+        "available": connected_light.available,
+        # Capabilities
+        "supports_on_off": connected_light.supports_on_off,
+        "supports_brightness": connected_light.supports_brightness,
+        "supports_colour_temp": connected_light.supports_colour_temp,
+        "supports_colour_xy": connected_light.supports_colour_xy,
+        "supports_effects": connected_light.supports_effects,
+        # Polled metadata
+        "manufacturer": (
+            await connected_light.poll_manufacturer()
+            if connected_light.manufacturer is not None
+            else None
+        ),
+        "model": (
+            await connected_light.poll_model()
+            if connected_light.model is not None
+            else None
+        ),
+        "firmware": (
+            await connected_light.poll_firmware()
+            if connected_light.firmware is not None
+            else None
+        ),
+        "zigbee_address": (
+            await connected_light.poll_zigbee_address()
+            if connected_light.zigbee_address is not None
+            else None
+        ),
+        # Polled connected_light state
+        "power_state": (
+            await connected_light.poll_power_state()
+            if connected_light.supports_on_off
+            else None
+        ),
+        "brightness": (
+            await connected_light.poll_brightness()
+            if connected_light.supports_brightness
+            else None
+        ),
+        "colour_temp": (
+            await connected_light.poll_colour_temp()
+            if connected_light.supports_colour_temp
+            else None
+        ),
+        "minimum_mireds": connected_light.minimum_mireds,
+        "maximum_mireds": connected_light.maximum_mireds,
+        "colour_xy": (
+            await connected_light.poll_colour_xy()
+            if connected_light.supports_colour_xy
+            else None
+        ),
+        "colour_temp_mode": connected_light.colour_temp_mode,
+    }
+
+    print(json.dumps(props, indent=4))
+
+
+async def strobe(args=()):
+    if connected_light is None:
+        print("Expects to be connected!")
+        return
+
+    if not connected_light.supports_brightness:
+        print("Unsupported")
+        return
+
+    print("Strobing")
+
+    while True:
+        rand = random.randrange(0, 255)
+
+        await connected_light.set_brightness(brightness=rand)
+        await asyncio.sleep(0.1)
+
+
+async def morse(args=()):
+    if connected_light is None:
+        print("Expects to be connected!")
+        return
+    if not connected_light.supports_brightness:
+        print("Unsupported")
+        return
+
+    morse_code = morse_code_converter.text_to_morse(args[0])
+    print(f"'{args[0]}' is {morse_code}.")
+    print("Signaling...")
+
+    for symbol in morse_code:
+        print(f"Signaling '{symbol}'")
+        if symbol in (" ", "/"):
+            await connected_light.set_brightness(brightness=0)
+            await asyncio.sleep(0.2)
+            continue
+
+        await connected_light.set_brightness(brightness=255)
+        await asyncio.sleep(1 if symbol == "-" else 0.5)
+        await connected_light.set_brightness(brightness=0)
+        await asyncio.sleep(0.5)
+
+
+async def set_brightness(args=()):
+    if connected_light is None:
+        print("Expects to be connected!")
+        return
+
+    try:
+        int(args[0])
+    except ValueError:
+        print("Expected a number.")
+        return
+
+    if int(args[0]) < 0 or int(args[0]) > 255:
+        print("Warning: truncating to fit range [0 - 255]")
+
+    if connected_light.supports_brightness:
+        await connected_light.set_brightness(brightness=int(args[0]))
+    else:
+        print("Unsupported.")
+
+
+async def set_on_off(args=()):
+    if connected_light is None:
+        print("Expects to be connected!")
+        return
+
+    if args[0] != "on" and args[0] != "off":
+        print("Warning: expected 'on' or 'off', defaulting to on.")
+
+    if connected_light.supports_on_off:
+        await connected_light.set_power(on=not (args[0] == "off"))
+    else:
+        print("Unsupported.")
+
+
+async def disconnect(args=()):
+    global connected_light
+    global status
+
+    if connected_light is None:
+        print("Expects to be connected!")
+        return
+
+    await connected_light.disconnect()
+    status = "DISCONNECTED"
+    connected_light = None
+
+
+async def run_command(coro):
+    global current_task
+    current_task = asyncio.current_task()
+    try:
+        await coro
+    except asyncio.CancelledError:
+        print("\nCancelled.")
+    finally:
+        current_task = None
+
+
+async def main():
+    readline.set_completer(completer)
+
+    history_file = os.path.expanduser("~/.hue_cli_history")
+
+    if os.path.exists(history_file):
+        readline.read_history_file(history_file)
+
+    readline.set_history_length(100)
+
+    readline.parse_and_bind("ctrl-l: clear-screen")
+    readline.parse_and_bind('"\\e[A": history-search-backward')
+    readline.parse_and_bind('"\\e[B": history-search-forward')
+    readline.parse_and_bind("tab: complete")
+
+    try:
+        while True:
+            try:
+                command, args = parse_tokens(input(prompt.format(status)))
+            except EOFError:
+                break
+
+            if not command:
+                continue
+
+            if command in ("quit", "exit") and expect_args(args, 0):
+                break
+
+            elif command == "help" and expect_args(args, 0):
+                print(f"Commands: {", ".join(commands)}")
+
+            elif command == "connect" and expect_args(args, 1):
+                await run_command(connect(args))
+
+            elif command == "disconnect" and expect_args(args, 0):
+                await run_command(disconnect(args))
+
+            elif command == "discover" and expect_args(args, 0):
+                await run_command(discover(args))
+
+            elif command == "info" and expect_args(args, 0):
+                await run_command(info(args))
+
+            elif command == "brightness" and expect_args(args, 1):
+                await run_command(set_brightness(args))
+
+            elif command == "power" and expect_args(args, 1):
+                await run_command(set_on_off(args))
+
+            elif command == "strobe" and expect_args(args, 0):
+                await run_command(strobe(args))
+
+            elif command == "morse" and expect_args(args, 1):
+                await run_command(morse(args))
+
+            else:
+                print(
+                    f"Unknown command or bad args: '{command}'. Type 'help' for options."
+                )
+
+    finally:
+        readline.write_history_file(history_file)
+
+
+if __name__ == "__main__":
+    print("- Hue Bluetooth Lamp Controller -\n")
+
+    signal.signal(signal.SIGINT, signal_handler)
+    asyncio.run(main())
+
+    print("\nGoodbye!")
